@@ -1607,9 +1607,9 @@ enable_mirror()
     local image=$3
     local mode=${4:-${RBD_MIRROR_MODE}}
 
-    rbd --cluster=${cluster} mirror image enable ${pool}/${image} ${mode}
+    run_cmd "rbd --cluster=${cluster} mirror image enable ${pool}/${image} ${mode}"
     # Display image info including the global image id for debugging purpose
-    rbd --cluster=${cluster} info ${pool}/${image}
+    run_cmd "rbd --cluster=${cluster} info ${pool}/${image}"
 }
 
 test_image_present()
@@ -1877,7 +1877,13 @@ mirror_group_snapshot()
     local cluster=$1
     local group_spec=$2
 
-    run_cmd "rbd --cluster=${cluster} mirror group snapshot ${group_spec}"
+    run_cmd "rbd --cluster=${cluster} mirror group snapshot ${group_spec}" || return 1
+
+    if [ "$#" -gt 2 ]
+    then
+      local -n _group_snap_id=$3
+      _group_snap_id=$(awk -F': ' '{print $NF}' "$CMD_STDOUT" )
+    fi
 }
 
 group_snap_create()
@@ -1907,6 +1913,52 @@ get_group_snap_count()
 
     run_cmd "rbd --cluster=${cluster} group snap ls --format xml --pretty-format ${group_spec}"
     _group_snap_count="$($XMLSTARLET sel -t -v "count(//group_snaps/group_snap[snapshot='${snap}'])" < "$CMD_STDOUT")"
+}
+
+get_group_snap_name()
+{
+    local cluster=$1
+    local group_spec=$2
+    local snap_id=$3
+    local -n _group_snap_name=$4
+
+    run_cmd "rbd --cluster=${cluster} group snap ls --format xml --pretty-format ${group_spec}"
+    _group_snap_name="$($XMLSTARLET sel -t -v "//group_snaps/group_snap[id='${snap_id}']/snapshot" < "$CMD_STDOUT")"
+}
+
+get_image_snap_id_from_group_snap_info()
+{
+    local cluster=$1
+    local snap_spec=$2
+    local image_spec=$3
+    local -n _image_snap_id=$4
+
+    run_cmd "rbd --cluster=${cluster} group snap info --format xml --pretty-format ${snap_spec}"
+    local image_name
+    image_name=$(echo "${image_spec}" | awk -F'/' '{print $NF}')
+    _image_snap_id="$($XMLSTARLET sel -t -v "//group_snapshot/images/image[image_name='${image_name}']/snap_id" < "$CMD_STDOUT")"
+}
+
+get_images_from_group_snap_info()
+{
+    local cluster=$1
+    local snap_spec=$2
+    local -n _images=$3
+
+    # TODO fix this to add the namespace to the image name if its not blank
+
+    run_cmd "rbd --cluster=${cluster} group snap info --format xml --pretty-format ${snap_spec}"
+    _images="$($XMLSTARLET sel -t -m "//group_snapshot/images/image" -v "pool_name" -o "/" -v "image_name" -o " " < "$CMD_STDOUT" )"
+}
+
+get_image_snap_complete()
+{
+    local cluster=$1
+    local image_spec=$2
+    local snap_id=$3
+    local -n _is_complete=$4
+    run_cmd "rbd --cluster=${cluster} snap list --all --format xml --pretty-format ${image_spec}"
+    _is_complete="$($XMLSTARLET sel -t -v "//snapshots/snapshot[id='${snap_id}']/namespace/complete" < "$CMD_STDOUT")"
 }
 
 check_group_snap_doesnt_exist()
@@ -1997,6 +2049,93 @@ wait_for_group_not_present()
     wait_for_test_group_present "${cluster}" "${pool}" "${group}" 0 0
 }
 
+test_group_snap_present()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+    local expected_snap_count=$4
+
+    # TODO - have seen this next cmd fail with rc=2 and an empty list
+    # this should not happen, but if it does then retry as a temp workaround
+    try_cmd "rbd --cluster ${cluster} group snap list ${group_spec} --format xml --pretty-format" 
+
+    test "${expected_snap_count}" = "$($XMLSTARLET sel -t -v "count(//group_snaps/group_snap[id='${group_snap_id}'])" < "$CMD_STDOUT")" || { fail; return 1; }
+}
+
+wait_for_test_group_snap_present()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+    local test_group_snap_count=$4
+    local s
+
+    for s in 0.1 1 2 4 8 8 8 8 8 8 8 8 16 16 32 32; do
+        sleep ${s}
+        test_group_snap_present "${cluster}" "${group_spec}" "${group_snap_id}" "${test_group_snap_count}" && return 0
+    done
+
+    fail "wait for count of group snaps with id ${group_snap_id} to be ${test_group_snap_count} failed on ${cluster}"
+    return 1
+}
+
+wait_for_group_snap_present()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+
+    wait_for_test_group_snap_present "${cluster}" "${group_spec}" "${group_snap_id}" 1
+}
+
+wait_for_group_snap_not_present()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+
+    wait_for_test_group_snap_present "${cluster}" "${group_spec}" "${group_snap_id}" 0
+}
+
+test_group_snap_sync_complete()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+
+    # TODO - have seen this next cmd fail with rc=2 and an empty list
+    # this should not happen, but if it does then retry as a temp workaround
+    try_cmd "rbd --cluster ${cluster} group snap list ${group_spec} --format xml --pretty-format" 
+
+    test 'complete' = "$($XMLSTARLET sel -t -v "//group_snaps/group_snap[id='${group_snap_id}']/state" < "$CMD_STDOUT")" || { fail; return 1; }
+}
+
+wait_for_test_group_snap_sync_complete()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+    local s
+
+    for s in 0.1 1 2 4 8 8 8 8 8 8 8 8 16 16 32 32; do
+        sleep ${s}
+        test_group_snap_sync_complete "${cluster}" "${group_spec}" "${group_snap_id}" && return 0
+    done
+
+    fail "wait for group snap with id ${group_snap_id} to be synced failed on ${cluster}"
+    return 1
+}
+
+wait_for_group_snap_sync_complete()
+{
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+
+    wait_for_test_group_snap_sync_complete "${cluster}" "${group_spec}" "${group_snap_id}"
+}
+
 test_group_replay_state()
 {
     local cluster=$1
@@ -2083,68 +2222,64 @@ get_newest_group_mirror_snapshot_id()
 
 mirror_group_snapshot_and_wait_for_sync_complete()
 {
-    local local_cluster=$1
-    local cluster=$2
+    local secondary_cluster=$1
+    local primary_cluster=$2
     local group_spec=$3
     local group_snap_id
-    local local_group_snap_id
 
     if [ "${MIRROR_IMAGE_MODE}" != "snapshot" ]; then
         return 1
     fi
 
-    mirror_group_snapshot "${cluster}" "${group_spec}"
-    get_newest_group_mirror_snapshot_id "${cluster}" "${group_spec}" group_snap_id
-
-    while true; do
-        for s in 0.2 0.4 0.8 1.6 2 2 4 4 8 8 16 16 32 32; do
-            sleep ${s}
-
-            get_newest_group_mirror_snapshot_id "${local_cluster}" "${group_spec}" local_group_snap_id
-            test "${local_group_snap_id}" = "${group_snap_id}" && return 0
-        done
-        fail "Failed to reach expected state"
-        return 1
-    done
-    return 1
+    mirror_group_snapshot "${primary_cluster}" "${group_spec}" group_snap_id
+    wait_for_group_snap_present "${secondary_cluster}" "${group_spec}" "${group_snap_id}"
+    wait_for_group_snap_sync_complete "${secondary_cluster}" "${group_spec}" "${group_snap_id}"
 }
 
-test_group_and_image_sync_status()
+test_group_synced_image_status()
 {
-    local local_cluster=$1
-    local cluster=$2
-    local group_spec=$3
-    local image_spec=$4
+    local cluster=$1
+    local group_spec=$2
+    local group_snap_id=$3
+    local expected_synced_image_count=$4
+
+    local group_snap_name
+    get_group_snap_name "${cluster}" "${group_spec}" "${group_snap_id}" group_snap_name
+
+    local images
+    get_images_from_group_snap_info "${cluster}" "${group_spec}@${group_snap_name}" images
+
+    local image_count=0
+    local image_spec
+    for image_spec in ${images}; do
+
+        # get the snap_id for this image from the group snap info
+        local image_snap_id
+        get_image_snap_id_from_group_snap_info "${cluster}" "${group_spec}@${group_snap_name}" "${image_spec}" image_snap_id
+            
+        # get the value in the "complete" field for the image and snap_id 
+        local is_complete
+        get_image_snap_complete "${cluster}" "${image_spec}" "${image_snap_id}" is_complete
+
+        test "${is_complete}" != "true" && { fail "image ${image_spec} is not synced"; return 1; }
+
+        image_count=$((image_count+1))
+    done
+
+    test "${image_count}" != "${expected_synced_image_count}" && fail "unexpected count ${image_count} != ${expected_synced_image_count}"
+
+    return 0
+}
+
+test_images_in_latest_synced_group()
+{
+    local cluster=$1
+    local group_spec=$2
+    local expected_synced_image_count=$3
 
     local group_snap_id
-    local local_group_snap_id
-
     get_newest_group_mirror_snapshot_id "${cluster}" "${group_spec}" group_snap_id
-
-	local local_image_status_log=${TEMPDIR}/$(mkfname ${local_cluster}-${group_spec}-${image_spec}-${local_group_snap_id}.status)
-
-    while true; do
-        for s in 0.4 1 1 1 2 2 2 4 8 16 16 32 32; do
-            sleep ${s}
-
-            get_newest_group_mirror_snapshot_id "${local_cluster}" "${group_spec}" local_group_snap_id
-            if [ "${local_group_snap_id}" == "${group_snap_id}" ]; then
-#TODO: Get the image snap for this group snap. For now, compare against the last mirror image .group snap.
-# use rbd group snap info <snap_name> for this once it is working properly
-                rbd --cluster "${local_cluster}" snap list --all "${image_spec}" --format xml | \
-                   $XMLSTARLET sel -t -c "//snapshots/snapshot[namespace/type='mirror' and position()=last()]" > ${local_image_status_log}
-                local image_snap_complete=$(xmlstarlet sel -t -v "//snapshot/namespace/complete" < ${local_image_status_log})
-                if [ "${image_snap_complete}" != "true" ]; then
-                    return 1
-                else
-                    return 0
-                fi
-            else
-                continue
-            fi
-        done
-        return 1
-    done
+    test_group_synced_image_status "${cluster}" "${group_spec}" "${group_snap_id}" "${expected_synced_image_count}"
 }
 
 test_group_status_in_pool_dir()

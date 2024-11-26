@@ -7,7 +7,11 @@
 # socket, temporary files, and launches rbd-mirror daemon.
 #
 
-set -ex
+if [ -n "${RBD_MIRROR_SHOW_CMD}" ]; then
+  set -e
+else  
+  set -ex
+fi  
 
 MIRROR_POOL_MODE=image
 MIRROR_IMAGE_MODE=snapshot
@@ -135,12 +139,13 @@ create_image ${CLUSTER2} ${POOL} ${big_image} 1G
 group_image_add ${CLUSTER2} ${POOL}/${group} ${POOL}/${big_image}
 write_image ${CLUSTER2} ${POOL} ${big_image} 1024 4194304
 wait_for_group_replay_started ${CLUSTER1} ${POOL}/${group} 2
-mirror_group_snapshot_and_wait_for_sync_complete ${CLUSTER1} ${CLUSTER2} ${POOL}/${group}
-test_group_and_image_sync_status ${CLUSTER1} ${CLUSTER2} ${POOL}/${group} ${POOL}/${big_image}
+mirror_group_snapshot_and_wait_for_sync_complete ${CLUSTER1} ${CLUSTER2} ${POOL}/${group} 
+test_images_in_latest_synced_group ${CLUSTER1} ${POOL}/${group} 2
 group_image_remove ${CLUSTER2} ${POOL}/${group} ${POOL}/${big_image}
 remove_image_retry ${CLUSTER2} ${POOL} ${big_image}
 wait_for_group_replay_started ${CLUSTER1} ${POOL}/${group} 1
 mirror_group_snapshot_and_wait_for_sync_complete ${CLUSTER1} ${CLUSTER2} ${POOL}/${group}
+test_images_in_latest_synced_group ${CLUSTER1} ${POOL}/${group} 1
 
 testlog "TEST: test group rename"
 new_name="${group}_RENAMED"
